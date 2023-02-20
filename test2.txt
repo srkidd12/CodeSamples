@@ -1,0 +1,458 @@
+
+/****** Object:  StoredProcedure [finance].[usp_get_billing_detail]    Script Date: 12/15/2022 2:24:22 PM ******/
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [finance].[usp_get_billing_detail]
+(@i_bgi_billing_output_id BIGINT)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /*--------------------------------- COMMENTS and NOTES --------------------------------------------------------------------------------------------------
+	created by:  amy Race
+	create date: 2022-01-21
+	description: This stored procedure stages the billing detail to go to healthx.  MFT will query the staged data and create files by bill.
+	standards review date: 12/19/2022
+	
+	---------------------------------------------------------------------------------------------------------------------------------------------------------
+	DEPENDENT OBJECTS
+		
+	SELECT ROW_NUMBER() OVER(ORDER BY referencing_id DESC) AS row
+	,LOWER(ISNULL([sed].[referenced_server_name]+'.','') + ISNULL(referenced_database_name+'.','')+ referenced_schema_name +'.'+ referenced_entity_name) as object_referenced
+	FROM sys.sql_expression_dependencies AS sed
+	INNER JOIN sys.objects AS o 
+	ON sed.referencing_id = o.object_id
+	WHERE referencing_id = OBJECT_ID(N'finance.usp_get_billing_detail');
+
+	---------------------------------------------------------------------------------------------------------------------------------------------------------
+	INPUTS
+	@i_bgi_billing_output_id
+
+	OUTPUTS
+	Writes rows to ProcessLog table
+	Writes rows to billing_detail_stage table
+
+	---------------------------------------------------------------------------------------------------------------------------------------------------------
+	NOTES and
+	Revisions: 
+	/*
+	Notes and Revisions:        
+	Date        Name            Proj/Tkt    Description
+	==========	============    =========== =================================================================================================================
+	2022-01-21	Amy Race		PROJ-001222	New dev
+	2022-05-10	Amy Race		PROJ-001222	Need to be able to consolidate some billing categories that were broken out by vendor
+	2022-06-30	Amy Race		PROJ-001222 Update query to allow null eff date and tiers
+	2022-07-20	Amy Race		PROJ-001222 1) Removing $ and - in money columns so the Excel will format as numeric
+											2) Adding statistical columns after the totals
+											3) Removing statistical money from the total column
+	2022-08-01	Amy Race		PROJ-001222	1) Need to add CASE statements to handle if statistical columns are NULL
+											2) Add bill mm and yy when joining totals 
+	2022-08-11	Amy Race		PROJ-001222	1) Add in version eff and exp to billing catgories query 
+	2022-09-20	Amy Race		PROJ-001222	1) Fix for coverage tiers rolling up for retros
+	2022-10-21  Stephen Kidd    PROJ-001222	Added a totals row for the billing category $$ columns
+	2022-11-01  Stephen Kidd	PROJ-001222 The sp_executesql stored procedure requires an NVARCHAR datatype, not VARCHAR.  Changing all variables and CASTs from VARCHAR to NVARCHAR
+	2022-12-16  Stephen Kidd	PROJ-001222 Updated JSON settings to include columns where the value is null.
+	
+	*/
+
+	/*---------- TESTING VARIABLES ----------
+	------------------------------------------
+	
+
+	------------------------------------------	*/
+
+	------------------ Process Log Parameters -----------------------------------
+	-----------------------------------------------------------------------------*/
+    DECLARE
+        @l_v_database_name VARCHAR(50)
+       ,@l_v_schema_name   VARCHAR(50)
+       ,@l_v_process       VARCHAR(255)
+       ,@l_v_object_name   VARCHAR(255)
+       ,@l_v_msg           VARCHAR(8000)
+       ,@l_v_data          VARCHAR(8000)
+       ,@l_v_event_status  VARCHAR(25)
+       ,@l_v_error_msg     VARCHAR(3000)
+       ,@c_i_return_fail   INT;
+
+    SET @l_v_process = 'Billing Exports';
+    SET @l_v_object_name = ISNULL (OBJECT_NAME (@@PROCID), 'Unknown');
+    SET @l_v_msg = 'Begin';
+    SET @l_v_data = '';
+    SET @c_i_return_fail = -1;
+    SET @l_v_event_status = 'Begin';
+
+    SELECT @l_v_database_name = DB_NAME ();
+
+    SET @l_v_schema_name = ISNULL (OBJECT_SCHEMA_NAME (@@PROCID), '.sql file');
+
+    -- Log the Start Time:
+    EXEC util.logs.usp_processlog
+        @p_DatabaseName = @l_v_database_name
+       ,@p_SchemaName = @l_v_schema_name
+       ,@p_Process = @l_v_process
+       ,@p_ObjectName = @l_v_object_name
+       ,@p_Msg = @l_v_msg
+       ,@p_Data = @l_v_data
+       ,@p_EventStatus = @l_v_event_status;
+
+    SET @l_v_msg = '';
+    SET @l_v_event_status = '';
+
+    --get internal
+    DECLARE
+        @l_bgi_billing_output_id                 BIGINT
+       ,@l_v_sql                                 NVARCHAR(MAX)
+       ,@l_v_category_list                       NVARCHAR(MAX)
+       ,@l_v_category_list_formatted             NVARCHAR(MAX)
+       ,@l_v_statistical_category_list           NVARCHAR(MAX)
+       ,@l_v_statistical_category_list_formatted NVARCHAR(MAX)
+       ,@l_v_json                                NVARCHAR(MAX)
+       ,@l_v_with_columns                        NVARCHAR(MAX)
+       ,@l_v_columns                             NVARCHAR(MAX)
+       ,@l_v_total_columns                       NVARCHAR(MAX)
+       ,@l_v_sql_json                            NVARCHAR(MAX);
+
+    SET @l_bgi_billing_output_id = @i_bgi_billing_output_id;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        --get billing category list by top account, will be the columns used in pivot
+        SELECT
+            @l_v_category_list = COALESCE (@l_v_category_list + ',', '') + N'[' + UPPER (bc.BILLING_CATEGORY_NAME)
+                                 + N']'
+           ,@l_v_category_list_formatted = COALESCE (@l_v_category_list_formatted + ',', '') + N'
+				CASE WHEN ['               + UPPER (bc.BILLING_CATEGORY_NAME)
+                                           + N'] IS NULL THEN CAST(''0.00'' AS NUMERIC(10,2))
+				ELSE  CAST(['              + UPPER (bc.BILLING_CATEGORY_NAME) + N'] AS NUMERIC(10,2))
+				END AS ['                  + UPPER (bc.BILLING_CATEGORY_NAME) + N']'
+        FROM (
+                 SELECT DISTINCT TOP 100 PERCENT --Need to include TOP when using ORDER BY in derived tables
+                        ISNULL (bcc.consolidation_name, bc.BILLING_CATEGORY_NAME) AS BILLING_CATEGORY_NAME
+                 FROM hrpdw.he.ALL_BILLING_CATEGORY_RATE_FACT abcr
+                     JOIN hrpdw.he.BILLING_RATE_HISTORY_FACT brh
+                         ON abcr.BILLING_RATE_HISTORY_FACT_KEY = brh.BILLING_RATE_HISTORY_FACT_KEY
+                     JOIN hrpdw.he.BILLING_CATEGORY_CODE bc
+                         ON abcr.BILLING_CATEGORY_KEY = bc.BILLING_CATEGORY_KEY
+                     CROSS APPLY util.ref.tudf_account (brh.ACCOUNT_KEY) asub
+                     CROSS APPLY util.ref.tudf_account (asub.top_account_key) atop
+                     LEFT JOIN finance.billing_categories bcc
+                         ON bcc.code = bc.BILLING_CATEGORY_CODE
+                     JOIN hrpdw.he.DATE_DIMENSION ddeff
+                         ON brh.VERSION_EFF_DATE_KEY = ddeff.DATE_KEY
+                     JOIN hrpdw.he.DATE_DIMENSION ddexp
+                         ON brh.VERSION_EXP_DATE_KEY = ddexp.DATE_KEY
+                 WHERE ISNULL (abcr.IS_STATISTICAL, 'N') = 'N'
+                       AND EXISTS (
+                                      SELECT TOP (1)
+                                             1
+                                      FROM finance.billing_outputs bo
+                                          JOIN finance.billing_xml_recipient r
+                                              ON bo.xml_file_id = r.xml_file_id
+                                          JOIN finance.billing_xml_header h
+                                              ON bo.xml_file_id = h.xml_file_id
+                                      WHERE bo.billing_output_id = @l_bgi_billing_output_id
+                                            AND r.recipientHccId = atop.account_hcc_id
+                                            AND ddeff.DATE_VALUE <= h.billPreviousThroughDate --previous through is the current start
+                                            AND ddexp.DATE_VALUE > h.billPreviousThroughDate
+                                  )
+                 ORDER BY ISNULL (bcc.consolidation_name, bc.BILLING_CATEGORY_NAME)
+             ) bc;
+
+        SELECT
+            @l_v_statistical_category_list = COALESCE (@l_v_statistical_category_list + ',', '') + N'['
+                                             + UPPER (bc.BILLING_CATEGORY_NAME) + N']'
+           ,@l_v_statistical_category_list_formatted = COALESCE (@l_v_statistical_category_list_formatted + ',', '')
+                                                       + N'
+				CASE WHEN ['                           + UPPER (bc.BILLING_CATEGORY_NAME)
+                                                       + N'] IS NULL THEN CAST(''0.00'' AS NUMERIC(10,2))
+				ELSE  CAST(['                          + UPPER (bc.BILLING_CATEGORY_NAME)
+                                                       + N'] AS NUMERIC(10,2))
+				END AS ['                              + UPPER (bc.BILLING_CATEGORY_NAME) + N']'
+        FROM (
+                 SELECT DISTINCT TOP 100 PERCENT --Need to include TOP when using ORDER BY in derived tables
+                        bc.BILLING_CATEGORY_NAME
+                 FROM hrpdw.he.ALL_BILLING_CATEGORY_RATE_FACT abcr
+                     JOIN hrpdw.he.BILLING_RATE_HISTORY_FACT brh
+                         ON abcr.BILLING_RATE_HISTORY_FACT_KEY = brh.BILLING_RATE_HISTORY_FACT_KEY
+                     JOIN hrpdw.he.BILLING_CATEGORY_CODE bc
+                         ON abcr.BILLING_CATEGORY_KEY = bc.BILLING_CATEGORY_KEY
+                     CROSS APPLY util.ref.tudf_account (brh.ACCOUNT_KEY) asub
+                     CROSS APPLY util.ref.tudf_account (asub.top_account_key) atop
+                     JOIN hrpdw.he.DATE_DIMENSION ddeff
+                         ON brh.VERSION_EFF_DATE_KEY = ddeff.DATE_KEY
+                     JOIN hrpdw.he.DATE_DIMENSION ddexp
+                         ON brh.VERSION_EXP_DATE_KEY = ddexp.DATE_KEY
+                 WHERE ISNULL (abcr.IS_STATISTICAL, 'N') = 'Y'
+                       AND EXISTS (
+                                      SELECT TOP (1)
+                                             1
+                                      FROM finance.billing_outputs bo
+                                          JOIN finance.billing_xml_recipient r
+                                              ON bo.xml_file_id = r.xml_file_id
+                                          JOIN finance.billing_xml_header h
+                                              ON bo.xml_file_id = h.xml_file_id
+                                      WHERE bo.billing_output_id = @l_bgi_billing_output_id
+                                            AND r.recipientHccId = atop.account_hcc_id
+                                            AND ddeff.DATE_VALUE <= h.billPreviousThroughDate --previous through is the current start
+                                            AND ddexp.DATE_VALUE > h.billPreviousThroughDate
+                                  )
+                 ORDER BY bc.BILLING_CATEGORY_NAME
+             ) bc;
+
+        SET @l_v_sql = N'
+		--get the totals by category, will pivot on category showing these amounts
+		;WITH cte_cat_totals
+            AS (
+               SELECT
+                   bld.account_hcc_id
+                  ,bld.account_name 
+                  ,bld.subscriber_hcc_id 
+                  ,bld.subscriber_full_name 
+                  ,bld.bill_month_mm 
+                  ,bld.bill_year_yy 
+                  ,bld.coverage_tier 
+                  ,bld.eff_date 
+                  ,bld.billing_category_name
+				  ,CASE 
+					WHEN bld.amount < 0 THEN 1
+					ELSE 0 
+				   END is_retro
+                  ,SUM(bld.amount) AS amt
+               FROM finance.billing_detail_staging bld
+               WHERE billing_output_id = ' + CAST(@l_bgi_billing_output_id AS NVARCHAR(20))
+                       + N'
+               GROUP BY
+                   bld.account_hcc_id
+                  ,bld.account_name
+                  ,bld.subscriber_hcc_id
+                  ,bld.subscriber_full_name
+                  ,bld.bill_month_mm
+                  ,bld.bill_year_yy
+                  ,bld.coverage_tier
+                  ,bld.eff_date
+                  ,bld.billing_category_name
+				  ,CASE 
+					WHEN bld.amount < 0 THEN 1
+					ELSE 0 
+				   END 
+               )
+			 --get totals of all categories, this will be added as the last Total column
+			 , cte_totals
+            AS (
+               SELECT
+                   bld.account_hcc_id 
+                  ,bld.account_name
+                  ,bld.subscriber_hcc_id 
+                  ,bld.subscriber_full_name 
+                  ,bld.bill_month_mm
+                  ,bld.bill_year_yy
+                  ,bld.coverage_tier 
+                  ,bld.eff_date 
+				   ,CASE 
+					WHEN bld.amount < 0 THEN 1
+					ELSE 0 
+				   END is_retro
+                  ,SUM(bld.amount)  AS total
+               FROM finance.billing_detail_staging bld
+               WHERE billing_output_id = ' + CAST(@l_bgi_billing_output_id AS NVARCHAR(20))
+                       + CASE
+                             WHEN @l_v_statistical_category_list IS NOT NULL THEN
+                                 ' AND bld.billing_category_name NOT IN ('
+                                 + REPLACE (REPLACE (@l_v_statistical_category_list, '[', ''''), ']', '''') + ')'
+                             ELSE
+                                 ''
+                         END
+                       + N'
+               GROUP BY
+                   bld.account_hcc_id
+                  ,bld.account_name
+                  ,bld.subscriber_hcc_id
+                  ,bld.subscriber_full_name
+                  ,bld.bill_month_mm
+                  ,bld.bill_year_yy
+                  ,bld.coverage_tier
+                  ,bld.eff_date
+				   ,CASE 
+					WHEN bld.amount < 0 THEN 1
+					ELSE 0 
+				   END 
+               )
+        --pivot category amounts data so categories are going across the columns
+		, cte_pivot AS (
+		SELECT *
+        FROM cte_cat_totals ct
+            PIVOT (
+                      SUM(amt)
+                      FOR billing_category_name IN (' + @l_v_category_list
+                       + N'
+                                                   )
+                  ) AS PVT
+			)' + CASE
+                     WHEN @l_v_statistical_category_list IS NOT NULL THEN
+                         '
+		, cte_pivot_stat AS (
+		SELECT *
+        FROM cte_cat_totals ct
+            PIVOT (
+                      SUM(amt)
+                      FOR billing_category_name IN (' + @l_v_statistical_category_list
+                         + '
+                                                   )
+                  ) AS PVT
+			)
+			'
+                     ELSE
+                         ''
+                 END + N'
+		SELECT @l_v_json = (SELECT
+			   p.account_hcc_id AS ACCOUNT_ID
+			 , p.account_name AS ACCOUNT_NAME
+			 , p.subscriber_hcc_id AS MEMBER_ID
+			 , p.subscriber_full_name AS MEMBER_NAME
+			 , p.bill_month_mm AS BILL_MONTH
+			 , p.bill_year_yy AS BILL_YEAR
+			 , p.coverage_tier AS TIER
+			 , p.eff_date AS EFFECTIVE_DATE
+			 , ' + @l_v_category_list_formatted + N'
+			 , t.total AS TOTAL			 
+			 ' + CASE
+                     WHEN @l_v_statistical_category_list IS NOT NULL THEN
+                         '
+			 , ' + @l_v_statistical_category_list_formatted + ''
+                     ELSE
+                         ''
+                 END + N'
+		FROM cte_pivot p 
+		JOIN cte_totals t 
+			ON p.account_hcc_id = t.account_hcc_id
+				AND p.subscriber_hcc_id = t.subscriber_hcc_id
+				AND p.bill_month_mm = t.bill_month_mm
+				AND p.bill_year_yy = t.bill_year_yy
+				AND ISNULL(p.coverage_tier,'''') = ISNULL(t.coverage_tier,'''')
+				AND ISNULL(p.eff_date,'''') = ISNULL(t.eff_date,'''')
+				AND p.is_retro = t.is_retro
+		' + CASE
+                WHEN @l_v_statistical_category_list IS NOT NULL THEN
+                    '
+		JOIN cte_pivot_stat st 
+			ON p.account_hcc_id = st.account_hcc_id
+				AND p.subscriber_hcc_id = st.subscriber_hcc_id
+				AND p.bill_month_mm = st.bill_month_mm
+				AND p.bill_year_yy = st.bill_year_yy
+				AND ISNULL(p.coverage_tier,'''') = ISNULL(st.coverage_tier,'''')
+				AND ISNULL(p.eff_date,'''') = ISNULL(st.eff_date,'''')
+				AND p.is_retro = t.is_retro'
+                ELSE
+                    ''
+            END + N' FOR JSON AUTO, INCLUDE_NULL_VALUES )
+				 
+				  	  ';
+
+        EXEC sp_executesql
+            @l_v_sql
+           ,N'@l_v_json NVARCHAR(MAX) OUTPUT'
+           ,@l_v_json = @l_v_json OUTPUT;
+
+        SELECT
+            @l_v_with_columns = STRING_AGG (   '[' + [Key] + '] ' + CASE [Type]
+                                                                        WHEN 0 THEN
+                                                                            ' nvarchar(200)'
+                                                                        WHEN 1 THEN
+                                                                            ' nvarchar(200)'
+                                                                        WHEN 2 THEN
+                                                                            '  NUMERIC(10,2)'
+                                                                        WHEN 3 THEN
+                                                                            ' [bit]'
+                                                                        WHEN 4 THEN
+                                                                            ' nvarchar(max)'
+                                                                        WHEN 5 THEN
+                                                                            ' nvarchar(max)'
+                                                                        ELSE
+                                                                            ' nvarchar(max)'
+                                                                    END + ' ''$."' + [Key] + '"'''
+                                              ,','
+                                           )
+           ,@l_v_columns = STRING_AGG ('[' + [Key] + '] ', ',')
+           ,@l_v_total_columns = STRING_AGG (   CASE
+                                                    WHEN [Type] = 2 THEN
+                                                        'SUM([' + [Key] + ']) '
+                                                    ELSE
+                                                        ''''''
+                                                END + ' [' + [Key] + ']'
+                                               ,','
+                                            )
+        FROM OPENJSON ((
+                           SELECT TOP 1 [Value] FROM OPENJSON (@l_v_json)
+                       )
+                      );
+        SET @l_v_sql_json = N'SELECT ' + @l_v_columns
+                            + N'
+FROM (
+SELECT ROW_NUMBER() OVER (ORDER BY [ACCOUNT_ID] DESC) RN, *
+FROM (SELECT
+    '                       + @l_v_columns + N'
+FROM
+    OPENJSON (@l_v_json)
+    WITH (
+             '              + @l_v_with_columns + N'
+         )
+UNION ALL
+SELECT 
+    '                       + @l_v_total_columns + N'
+FROM
+    OPENJSON (@l_v_json)
+    WITH (
+             '              + @l_v_with_columns + N'
+         )) a) b;';
+
+        EXEC sp_executesql
+            @l_v_sql_json
+           ,N'@l_v_json NVARCHAR(MAX)'
+           ,@l_v_json = @l_v_json;
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        SET @l_v_event_status = 'FAIL';
+        SET @l_v_error_msg = ' Line Number: ' + CAST(ERROR_LINE () AS VARCHAR) + ISNULL (ERROR_MESSAGE (), '');
+        SET @l_v_msg = 'ERROR: ..Additional Info: ' + @l_v_error_msg;
+
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        EXEC util.logs.usp_processlog
+            @p_DatabaseName = @l_v_database_name
+           ,@p_SchemaName = @l_v_schema_name
+           ,@p_Process = @l_v_process
+           ,@p_ObjectName = @l_v_object_name
+           ,@p_Msg = @l_v_msg
+           ,@p_Data = @l_v_data
+           ,@p_EventStatus = @l_v_event_status;
+
+        THROW;
+
+        RETURN @c_i_return_fail;
+    END CATCH;
+
+    -----------------------------------------------------------------------------*/
+    ------------------ Log the Successful Ending: -------------------------------
+    -----------------------------------------------------------------------------
+    SET @l_v_msg = 'End: ';
+    SET @l_v_event_status = 'Passed ';
+
+    EXEC util.logs.usp_processlog
+        @p_DatabaseName = @l_v_database_name
+       ,@p_SchemaName = @l_v_schema_name
+       ,@p_Process = @l_v_process
+       ,@p_ObjectName = @l_v_object_name
+       ,@p_Msg = @l_v_msg
+       ,@p_Data = @l_v_data
+       ,@p_EventStatus = @l_v_event_status;
+
+    -----------------------------------------------------------------------------*/
+    RETURN 0;
+END;
